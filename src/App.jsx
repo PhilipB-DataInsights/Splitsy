@@ -1,9 +1,24 @@
 import { useState, useEffect, useCallback } from "react";
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from "recharts";
 import { db } from "./firebase.js";
-import { ref, set, get, onValue, off } from "firebase/database";
+import { ref, set, get, remove as fbRemove, onValue, off } from "firebase/database";
 
 const COLORS = ["#5b4dc7", "#e85d75", "#f5a623", "#2ec4b6", "#9b5de5", "#00bbf9", "#f15bb5", "#00f5d4", "#fee440", "#8ac926"];
+
+const CATEGORIES = [
+  { id: "food", label: "Food & Dining", icon: "\uD83C\uDF74" },
+  { id: "drinks", label: "Drinks & Bar", icon: "\uD83C\uDF7B" },
+  { id: "shopping", label: "Shopping", icon: "\uD83D\uDECD\uFE0F" },
+  { id: "transport", label: "Transport", icon: "\uD83D\uDE95" },
+  { id: "accommodation", label: "Accommodation", icon: "\uD83C\uDFE8" },
+  { id: "entertainment", label: "Entertainment", icon: "\uD83C\uDFAC" },
+  { id: "groceries", label: "Groceries", icon: "\uD83D\uDED2" },
+  { id: "other", label: "Other", icon: "\uD83D\uDCCB" },
+];
+
+function getCategoryById(id) {
+  return CATEGORIES.find((c) => c.id === id) || CATEGORIES[CATEGORIES.length - 1];
+}
 
 function generateId() {
   return Math.random().toString(36).substring(2, 10);
@@ -15,7 +30,7 @@ function getGroupIdFromHash() {
 }
 
 // ─── Settlement calculator ───────────────────────────────
-function calculateSettlements(members, expenses) {
+function calculateSettlements(members, expenses, settledPayments) {
   const balances = {};
   members.forEach((m) => (balances[m] = 0));
   expenses.forEach((exp) => {
@@ -25,6 +40,16 @@ function calculateSettlements(members, expenses) {
       balances[person] = (balances[person] || 0) - splitAmount;
     });
   });
+
+  // Apply settled payments
+  const settled = settledPayments || {};
+  Object.values(settled).forEach((payment) => {
+    if (payment.settled) {
+      balances[payment.from] = (balances[payment.from] || 0) + payment.amount;
+      balances[payment.to] = (balances[payment.to] || 0) - payment.amount;
+    }
+  });
+
   const debtors = [], creditors = [];
   Object.entries(balances).forEach(([person, balance]) => {
     if (balance < -0.01) debtors.push({ person, amount: -balance });
@@ -67,6 +92,23 @@ async function loadGroup(groupId) {
   return snapshot.exists() ? snapshot.val() : null;
 }
 
+function deleteGroup(groupId) {
+  return fbRemove(ref(db, `groups/${groupId}`));
+}
+
+function normalizeGroupData(data) {
+  if (!data) return data;
+  if (!data.expenses) data.expenses = [];
+  else if (!Array.isArray(data.expenses)) data.expenses = Object.values(data.expenses);
+  if (!data.settledPayments) data.settledPayments = {};
+  else if (Array.isArray(data.settledPayments)) {
+    const obj = {};
+    data.settledPayments.forEach((p, i) => { if (p) obj[p.id || i] = p; });
+    data.settledPayments = obj;
+  }
+  return data;
+}
+
 // Local storage for "my groups" list (per device)
 function loadMyGroups() {
   try { return JSON.parse(localStorage.getItem("splitsy_my_groups") || "[]"); }
@@ -77,11 +119,17 @@ function saveMyGroups(groups) {
   localStorage.setItem("splitsy_my_groups", JSON.stringify(groups));
 }
 
-function addToMyGroups(groupId, groupName, userName) {
+function addToMyGroups(groupId, groupName, userName, isCreator = false) {
   const groups = loadMyGroups();
   const existing = groups.find((g) => g.id === groupId);
-  if (existing) { existing.name = groupName; existing.user = userName; existing.lastAccessed = Date.now(); }
-  else { groups.push({ id: groupId, name: groupName, user: userName, lastAccessed: Date.now() }); }
+  if (existing) {
+    existing.name = groupName;
+    existing.user = userName;
+    existing.lastAccessed = Date.now();
+    if (isCreator) existing.isCreator = true;
+  } else {
+    groups.push({ id: groupId, name: groupName, user: userName, lastAccessed: Date.now(), isCreator });
+  }
   saveMyGroups(groups);
 }
 
@@ -117,8 +165,9 @@ const renderDonutLabel = ({ cx, cy, midAngle, innerRadius, outerRadius, name, pe
 // ─── SCREENS ──────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════
 
-function HomeScreen({ onCreateGroup, onJoinGroup, myGroups, onOpenGroup, onRemoveGroup }) {
+function HomeScreen({ onCreateGroup, onJoinGroup, myGroups, onOpenGroup, onDeleteGroup }) {
   const [joinCode, setJoinCode] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(null); // groupId to confirm
 
   return (
     <div style={styles.homeWrap}>
@@ -146,11 +195,39 @@ function HomeScreen({ onCreateGroup, onJoinGroup, myGroups, onOpenGroup, onRemov
               <div style={styles.groupCardIcon}>{g.name.charAt(0).toUpperCase()}</div>
               <div style={{ flex: 1 }}>
                 <div style={styles.groupCardName}>{g.name}</div>
-                <div style={styles.groupCardMeta}>as {g.user}</div>
+                <div style={styles.groupCardMeta}>as {g.user}{g.isCreator ? " \u00B7 creator" : ""}</div>
               </div>
-              <button style={styles.groupRemoveBtn} onClick={(e) => { e.stopPropagation(); onRemoveGroup(g.id); }}>{"\u2715"}</button>
+              {g.isCreator && (
+                <button style={styles.groupRemoveBtn} onClick={(e) => { e.stopPropagation(); setConfirmDelete(g.id); }}>{"\u2715"}</button>
+              )}
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Delete confirmation modal */}
+      {confirmDelete && (
+        <div style={styles.overlay} onClick={() => setConfirmDelete(null)}>
+          <div style={styles.inviteModal} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: "0 0 8px", fontSize: 17, fontWeight: 700, color: "#1a1a2e" }}>Delete Group?</h3>
+            <p style={{ fontSize: 14, color: "#666", margin: "0 0 20px", lineHeight: 1.5 }}>
+              This will permanently delete the group and all its expenses for everyone. This can't be undone.
+            </p>
+            <p style={{ fontSize: 13, color: "#999", margin: "0 0 20px" }}>
+              Note: You can only delete a group once all debts are settled.
+            </p>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button style={{ ...styles.secondaryBtn, flex: 1, padding: "12px" }} onClick={() => setConfirmDelete(null)}>Cancel</button>
+              <button style={{ ...styles.primaryBtn, flex: 1, padding: "12px", background: "#e85d75", boxShadow: "0 4px 16px rgba(232,93,117,0.25)" }}
+                onClick={async () => {
+                  const result = await onDeleteGroup(confirmDelete);
+                  if (result === "not_settled") {
+                    alert("Can't delete yet \u2014 there are still unsettled debts. Go to the Settle Up tab first.");
+                  }
+                  setConfirmDelete(null);
+                }}>Delete Group</button>
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -186,11 +263,42 @@ function JoinScreen({ groupData, onJoined }) {
   );
 }
 
+// ─── CATEGORY PICKER ─────────────────────────────────────
+function CategoryPicker({ value, onChange }) {
+  const [open, setOpen] = useState(false);
+  const selected = getCategoryById(value);
+
+  return (
+    <div style={{ position: "relative", marginTop: 12 }}>
+      <button style={styles.categoryBtn} onClick={() => setOpen(!open)}>
+        <span style={{ fontSize: 18 }}>{selected.icon}</span>
+        <span style={{ flex: 1, textAlign: "left" }}>{selected.label}</span>
+        <span style={{ color: "#999", fontSize: 12 }}>{open ? "\u25B2" : "\u25BC"}</span>
+      </button>
+      {open && (
+        <div style={styles.categoryDropdown}>
+          {CATEGORIES.map((cat) => (
+            <button
+              key={cat.id}
+              style={{ ...styles.categoryOption, ...(value === cat.id ? { background: "#eee8ff", color: "#5b4dc7" } : {}) }}
+              onClick={() => { onChange(cat.id); setOpen(false); }}
+            >
+              <span style={{ fontSize: 16 }}>{cat.icon}</span>
+              <span>{cat.label}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── GROUP SCREEN ────────────────────────────────────────
 function GroupScreen({ groupId, groupData, setGroupData, currentUser, onSwitchUser }) {
   const [showAdd, setShowAdd] = useState(false);
   const [desc, setDesc] = useState("");
   const [amount, setAmount] = useState("");
+  const [category, setCategory] = useState("food");
   const [paidBy, setPaidBy] = useState(currentUser);
   const [splitAmong, setSplitAmong] = useState([...groupData.members]);
   const [copied, setCopied] = useState(false);
@@ -206,16 +314,8 @@ function GroupScreen({ groupId, groupData, setGroupData, currentUser, onSwitchUs
     const groupRef = ref(db, `groups/${groupId}`);
     const unsub = onValue(groupRef, (snapshot) => {
       if (snapshot.exists()) {
-        const data = snapshot.val();
-        // Firebase drops empty arrays, so ensure expenses is always an array
-        if (!data.expenses) data.expenses = [];
-        if (Array.isArray(data.expenses)) {
-          setGroupData(data);
-        } else {
-          // Firebase converts arrays to objects if keys are numeric — convert back
-          data.expenses = Object.values(data.expenses);
-          setGroupData(data);
-        }
+        const data = normalizeGroupData(snapshot.val());
+        setGroupData(data);
       }
     });
     return () => off(groupRef, "value", unsub);
@@ -225,7 +325,6 @@ function GroupScreen({ groupId, groupData, setGroupData, currentUser, onSwitchUs
 
   const copyLink = () => {
     navigator.clipboard.writeText(shareLink).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2000); }).catch(() => {
-      // Fallback for mobile
       const ta = document.createElement("textarea"); ta.value = shareLink;
       document.body.appendChild(ta); ta.select(); document.execCommand("copy");
       document.body.removeChild(ta);
@@ -244,10 +343,10 @@ function GroupScreen({ groupId, groupData, setGroupData, currentUser, onSwitchUs
 
   const addExpense = async () => {
     if (!desc || !amount || !paidBy || splitAmong.length === 0) return;
-    const expense = { id: generateId(), description: desc, amount: parseFloat(amount), paidBy, splitAmong: [...splitAmong], date: new Date().toISOString() };
+    const expense = { id: generateId(), description: desc, amount: parseFloat(amount), category, paidBy, splitAmong: [...splitAmong], date: new Date().toISOString() };
     const updated = { ...groupData, expenses: [...(groupData.expenses || []), expense] };
     await saveGroup(groupId, updated);
-    setDesc(""); setAmount(""); setPaidBy(currentUser); setSplitAmong([...groupData.members]); setShowAdd(false);
+    setDesc(""); setAmount(""); setCategory("food"); setPaidBy(currentUser); setSplitAmong([...groupData.members]); setShowAdd(false);
   };
 
   const removeExpense = async (id) => {
@@ -256,10 +355,37 @@ function GroupScreen({ groupId, groupData, setGroupData, currentUser, onSwitchUs
   };
 
   const expenses = groupData.expenses || [];
-  const settlements = calculateSettlements(groupData.members, expenses);
+  const settledPayments = groupData.settledPayments || {};
+
+  // Calculate settlements WITHOUT settled payments applied (to show original debts)
+  const originalSettlements = calculateSettlements(groupData.members, expenses, {});
+  // Calculate remaining settlements WITH settled payments applied
+  const remainingSettlements = calculateSettlements(groupData.members, expenses, settledPayments);
+
   const totalSpent = expenses.reduce((s, e) => s + e.amount, 0);
   const donutData = getSpendByPerson(groupData.members, expenses);
   const toggleSplit = (name) => setSplitAmong((prev) => prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name]);
+
+  // Check if a specific from->to payment is settled
+  const isPaymentSettled = (from, to) => {
+    return Object.values(settledPayments).some((p) => p.from === from && p.to === to && p.settled);
+  };
+
+  const toggleSettlement = async (from, to, amount) => {
+    const key = `${from}_${to}`;
+    const newSettled = { ...settledPayments };
+    if (isPaymentSettled(from, to)) {
+      // Unsettle
+      delete newSettled[key];
+    } else {
+      // Settle
+      newSettled[key] = { from, to, amount, settled: true, settledAt: new Date().toISOString(), settledBy: currentUser };
+    }
+    const updated = { ...groupData, settledPayments: newSettled };
+    await saveGroup(groupId, updated);
+  };
+
+  const allSettled = originalSettlements.length > 0 && remainingSettlements.length === 0;
 
   return (
     <div style={styles.container}>
@@ -353,32 +479,63 @@ function GroupScreen({ groupId, groupData, setGroupData, currentUser, onSwitchUs
         {tab === "expenses" && (
           <>
             {expenses.length === 0 && <p style={styles.empty}>No expenses yet. Add one below!</p>}
-            {[...expenses].reverse().map((exp) => (
-              <div key={exp.id} style={styles.card}>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={styles.cardTitle}>{exp.description}</div>
-                  <div style={styles.cardMeta}><strong>{exp.paidBy}</strong> paid · split {exp.splitAmong.length} way{exp.splitAmong.length !== 1 ? "s" : ""}</div>
+            {[...expenses].reverse().map((exp) => {
+              const cat = getCategoryById(exp.category);
+              return (
+                <div key={exp.id} style={styles.card}>
+                  <div style={styles.cardCategoryIcon}>{cat.icon}</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={styles.cardTitle}>{exp.description}</div>
+                    <div style={styles.cardMeta}>
+                      <strong>{exp.paidBy}</strong> paid · {cat.label} · split {exp.splitAmong.length} way{exp.splitAmong.length !== 1 ? "s" : ""}
+                    </div>
+                  </div>
+                  <div style={styles.cardRight}>
+                    <div style={styles.cardAmount}>${exp.amount.toFixed(2)}</div>
+                    <button style={styles.removeBtn} onClick={() => removeExpense(exp.id)}>{"\u2715"}</button>
+                  </div>
                 </div>
-                <div style={styles.cardRight}>
-                  <div style={styles.cardAmount}>${exp.amount.toFixed(2)}</div>
-                  <button style={styles.removeBtn} onClick={() => removeExpense(exp.id)}>{"\u2715"}</button>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </>
         )}
         {tab === "settle" && (
           <>
-            {settlements.length === 0 && <p style={styles.empty}>All settled up! 🎉</p>}
-            {settlements.map((s, i) => (
-              <div key={i} style={styles.settleCard}>
-                <span style={styles.settleName}>{s.from}</span>
-                <span style={styles.settleArrow}>{"\u2192"}</span>
-                <span style={styles.settleName}>{s.to}</span>
-                <span style={styles.settleAmount}>${s.amount.toFixed(2)}</span>
+            {allSettled && (
+              <div style={styles.allSettledBanner}>
+                <span style={{ fontSize: 24 }}>🎉</span>
+                <div>
+                  <div style={{ fontWeight: 700, color: "#1a1a2e", fontSize: 15 }}>All settled up!</div>
+                  <div style={{ fontSize: 12, color: "#888", marginTop: 2 }}>Everyone is square</div>
+                </div>
               </div>
-            ))}
-            {settlements.length > 0 && <p style={{ fontSize: 13, color: "#888", textAlign: "center", marginTop: 16 }}>{settlements.length} payment{settlements.length !== 1 ? "s" : ""} to settle all debts</p>}
+            )}
+            {originalSettlements.length === 0 && !allSettled && <p style={styles.empty}>No debts to settle!</p>}
+            {originalSettlements.map((s, i) => {
+              const settled = isPaymentSettled(s.from, s.to);
+              return (
+                <div key={i} style={{ ...styles.settleCard, ...(settled ? styles.settleCardSettled : {}) }}>
+                  <button
+                    style={{ ...styles.settleCheck, ...(settled ? styles.settleCheckActive : {}) }}
+                    onClick={() => toggleSettlement(s.from, s.to, s.amount)}
+                    title={settled ? "Undo settlement" : "Mark as paid"}
+                  >
+                    {settled ? "\u2713" : ""}
+                  </button>
+                  <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ ...styles.settleName, ...(settled ? { textDecoration: "line-through", color: "#aaa" } : {}) }}>{s.from}</span>
+                    <span style={styles.settleArrow}>{"\u2192"}</span>
+                    <span style={{ ...styles.settleName, ...(settled ? { textDecoration: "line-through", color: "#aaa" } : {}) }}>{s.to}</span>
+                  </div>
+                  <span style={{ ...styles.settleAmount, ...(settled ? { color: "#aaa", textDecoration: "line-through" } : {}) }}>${s.amount.toFixed(2)}</span>
+                </div>
+              );
+            })}
+            {originalSettlements.length > 0 && !allSettled && (
+              <p style={{ fontSize: 13, color: "#888", textAlign: "center", marginTop: 16 }}>
+                Tap the circle to mark a payment as settled
+              </p>
+            )}
           </>
         )}
       </div>
@@ -394,6 +551,10 @@ function GroupScreen({ groupId, groupData, setGroupData, currentUser, onSwitchUs
           </div>
           <input style={styles.formInput} placeholder="What for?" value={desc} onChange={(e) => setDesc(e.target.value)} />
           <input style={styles.formInput} placeholder="Amount" type="number" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} />
+
+          <label style={styles.fieldLabel}>Category</label>
+          <CategoryPicker value={category} onChange={setCategory} />
+
           <label style={styles.fieldLabel}>Who paid?</label>
           <div style={styles.chipRow}>
             {groupData.members.map((m) => (
@@ -468,14 +629,11 @@ export default function App() {
       setScreen("setup");
       return;
     }
-    // Ensure expenses is an array
-    if (!data.expenses) data.expenses = [];
-    else if (!Array.isArray(data.expenses)) data.expenses = Object.values(data.expenses);
-
-    setGroupData(data);
+    const normalized = normalizeGroupData(data);
+    setGroupData(normalized);
     const groups = loadMyGroups();
     const myEntry = groups.find((g) => g.id === hashId);
-    if (myEntry && data.members.includes(myEntry.user)) {
+    if (myEntry && normalized.members.includes(myEntry.user)) {
       setCurrentUser(myEntry.user);
       setScreen("group");
     } else {
@@ -492,13 +650,32 @@ export default function App() {
 
   const createGroup = () => { window.location.hash = generateId(); };
   const joinGroupByCode = (code) => {
-    // If someone pastes a full URL, extract just the group code after #
     const hashIndex = code.lastIndexOf("#");
     const cleanCode = hashIndex !== -1 ? code.substring(hashIndex + 1) : code;
     window.location.hash = cleanCode;
   };
   const openGroup = (id) => { window.location.hash = id; };
-  const handleRemoveGroup = (id) => { removeFromMyGroups(id); refreshMyGroups(); };
+
+  const handleDeleteGroup = async (id) => {
+    // Load group to check if settled
+    const data = await loadGroup(id);
+    if (data) {
+      const normalized = normalizeGroupData(data);
+      const expenses = normalized.expenses || [];
+      const settledPayments = normalized.settledPayments || {};
+      const originalSettlements = calculateSettlements(normalized.members, expenses, {});
+      // Check every original settlement is marked as settled
+      const allSettled = originalSettlements.length === 0 || originalSettlements.every((s) =>
+        Object.values(settledPayments).some((p) => p.from === s.from && p.to === s.to && p.settled)
+      );
+      if (!allSettled) return "not_settled";
+    }
+    // Delete from Firebase and local
+    await deleteGroup(id);
+    removeFromMyGroups(id);
+    refreshMyGroups();
+    return "deleted";
+  };
 
   const switchUser = () => {
     const id = getGroupIdFromHash();
@@ -509,9 +686,9 @@ export default function App() {
 
   const finishSetup = async (name, myName) => {
     const id = getGroupIdFromHash();
-    const data = { name, members: [myName], expenses: [] };
+    const data = { name, members: [myName], expenses: [], settledPayments: {}, createdBy: myName };
     await saveGroup(id, data);
-    addToMyGroups(id, name, myName);
+    addToMyGroups(id, name, myName, true);
     setGroupData(data);
     setCurrentUser(myName);
     setScreen("group");
@@ -521,10 +698,11 @@ export default function App() {
     const id = getGroupIdFromHash();
     let updated = groupData;
     if (!groupData.members.includes(myName)) {
-      updated = { ...groupData, members: [...groupData.members, myName], expenses: groupData.expenses || [] };
+      updated = { ...groupData, members: [...groupData.members, myName] };
       await saveGroup(id, updated);
     }
-    addToMyGroups(id, updated.name, myName);
+    const isCreator = updated.createdBy === myName;
+    addToMyGroups(id, updated.name, myName, isCreator);
     setGroupData(updated);
     setCurrentUser(myName);
     setScreen("group");
@@ -533,7 +711,7 @@ export default function App() {
   return (
     <div style={{ position: "relative", minHeight: "100vh" }}>
       {screen === "loading" && <div style={styles.center}><p style={styles.subtitle}>Loading...</p></div>}
-      {screen === "home" && <HomeScreen onCreateGroup={createGroup} onJoinGroup={joinGroupByCode} myGroups={myGroups} onOpenGroup={openGroup} onRemoveGroup={handleRemoveGroup} />}
+      {screen === "home" && <HomeScreen onCreateGroup={createGroup} onJoinGroup={joinGroupByCode} myGroups={myGroups} onOpenGroup={openGroup} onDeleteGroup={handleDeleteGroup} />}
       {screen === "setup" && <SetupScreen onDone={finishSetup} />}
       {screen === "join" && groupData && <JoinScreen groupData={groupData} onJoined={joinGroup} />}
       {screen === "group" && groupData && <GroupScreen groupId={groupId} groupData={groupData} setGroupData={setGroupData} currentUser={currentUser} onSwitchUser={switchUser} />}
@@ -642,16 +820,55 @@ const styles = {
   tabActive: { background: "#fff", color: "#1a1a2e", boxShadow: "0 1px 4px rgba(0,0,0,0.06)" },
   content: { padding: "8px 16px" },
   empty: { textAlign: "center", color: "#999", fontSize: 14, padding: "40px 0" },
-  card: { display: "flex", alignItems: "center", background: "#fff", borderRadius: 14, padding: "14px 16px", marginBottom: 10, boxShadow: "0 1px 4px rgba(0,0,0,0.04)" },
+  card: { display: "flex", alignItems: "center", background: "#fff", borderRadius: 14, padding: "14px 16px", marginBottom: 10, boxShadow: "0 1px 4px rgba(0,0,0,0.04)", gap: 12 },
+  cardCategoryIcon: { fontSize: 24, flexShrink: 0 },
   cardTitle: { fontSize: 15, fontWeight: 600, color: "#1a1a2e" },
   cardMeta: { fontSize: 12, color: "#999", marginTop: 2 },
-  cardRight: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4, flexShrink: 0, marginLeft: 12 },
+  cardRight: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4, flexShrink: 0, marginLeft: "auto" },
   cardAmount: { fontSize: 18, fontWeight: 700, color: "#5b4dc7" },
   removeBtn: { background: "none", border: "none", color: "#ccc", cursor: "pointer", fontSize: 13, padding: 2 },
-  settleCard: { display: "flex", alignItems: "center", gap: 12, background: "#fff", borderRadius: 14, padding: "14px 16px", marginBottom: 10, boxShadow: "0 1px 4px rgba(0,0,0,0.04)" },
-  settleName: { fontWeight: 600, color: "#1a1a2e", fontSize: 15 },
-  settleArrow: { color: "#5b4dc7", fontWeight: 700, fontSize: 18 },
-  settleAmount: { marginLeft: "auto", fontWeight: 700, color: "#5b4dc7", fontSize: 18 },
+
+  // Settle
+  settleCard: {
+    display: "flex", alignItems: "center", gap: 10, background: "#fff", borderRadius: 14,
+    padding: "14px 16px", marginBottom: 10, boxShadow: "0 1px 4px rgba(0,0,0,0.04)",
+    transition: "all 0.2s",
+  },
+  settleCardSettled: { background: "#f8fff8", borderLeft: "3px solid #2ec4b6" },
+  settleCheck: {
+    width: 28, height: 28, borderRadius: "50%", border: "2px solid #ddd", background: "#fff",
+    display: "flex", alignItems: "center", justifyContent: "center",
+    fontSize: 14, fontWeight: 700, cursor: "pointer", color: "transparent",
+    flexShrink: 0, transition: "all 0.2s",
+  },
+  settleCheckActive: { background: "#2ec4b6", borderColor: "#2ec4b6", color: "#fff" },
+  settleName: { fontWeight: 600, color: "#1a1a2e", fontSize: 14 },
+  settleArrow: { color: "#5b4dc7", fontWeight: 700, fontSize: 16 },
+  settleAmount: { fontWeight: 700, color: "#5b4dc7", fontSize: 16, flexShrink: 0 },
+  allSettledBanner: {
+    display: "flex", alignItems: "center", gap: 12, background: "#f0faf8", borderRadius: 14,
+    padding: "16px 20px", marginBottom: 16, border: "1px solid #d0ece8",
+  },
+
+  // Category picker
+  categoryBtn: {
+    width: "100%", display: "flex", alignItems: "center", gap: 10,
+    padding: "12px 14px", borderRadius: 10, border: "2px solid #e8e6f0",
+    background: "#fff", fontSize: 14, fontWeight: 600, color: "#1a1a2e",
+    cursor: "pointer", boxSizing: "border-box",
+  },
+  categoryDropdown: {
+    position: "absolute", top: "100%", left: 0, right: 0, marginTop: 4,
+    background: "#fff", borderRadius: 12, border: "1px solid #e8e6f0",
+    boxShadow: "0 8px 24px rgba(0,0,0,0.12)", zIndex: 30, overflow: "hidden",
+    maxHeight: 240, overflowY: "auto",
+  },
+  categoryOption: {
+    width: "100%", display: "flex", alignItems: "center", gap: 10,
+    padding: "10px 14px", border: "none", background: "#fff",
+    fontSize: 14, color: "#1a1a2e", cursor: "pointer", textAlign: "left",
+  },
+
   fab: { position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)", background: "#5b4dc7", color: "#fff", border: "none", borderRadius: 16, padding: "16px 32px", fontSize: 15, fontWeight: 600, cursor: "pointer", boxShadow: "0 8px 24px rgba(91,77,199,0.35)", zIndex: 20 },
   addForm: { position: "fixed", bottom: 0, left: 0, right: 0, background: "#fff", borderRadius: "20px 20px 0 0", padding: "20px 24px 32px", boxShadow: "0 -8px 32px rgba(0,0,0,0.1)", zIndex: 20, maxHeight: "80vh", overflowY: "auto" },
   formInput: { width: "100%", padding: "12px 14px", borderRadius: 10, border: "2px solid #e8e6f0", fontSize: 15, outline: "none", marginTop: 12, boxSizing: "border-box" },
